@@ -703,7 +703,7 @@ namespace discamb {
     //constexpr bool virtLineTemperatureFlag = true; // maybe add later (the ability to change to false)
     constexpr bool virtHklPhaseFlag = false;
     constexpr bool virtHklTemperatureFlag = false;
-    constexpr bool virtHklTMulFlag = true;
+    constexpr bool virtHklTMulFlag = false;
     //constexpr bool symOpExtractionFlag = true; // maybe add later (the ability to change to false)
     //constexpr bool fSymDeduplicationFlag = false; // cctbx already dedupes // maybe add later (the ability to change to true)
     //constexpr bool versorDeduplicationFlag = true; // maybe add later (the ability to change to true) since it should only speed it up ~1.2 times
@@ -779,7 +779,7 @@ return std::sinf(std::fmodf(x, two_pi));
         const std::vector<Vector3<REAL> > &atomicPositions, // per atom
         const std::vector<std::vector<REAL> > &atomic_displacement_parameters, // per atom and already premultiplied by two_pi_squared
         const std::vector<REAL> &atomic_occupancy,
-        const std::vector<std::complex<REAL> >& anomalous_dispersion, // per atom // TODO use
+        const std::vector<std::complex<REAL> >& anomalous_dispersion, // per atom
         const std::vector<REAL> &atomic_multiplicity_factor,
         const std::vector<Matrix3<REAL> > &local_coordinate_systems, // per atom
         const std::vector<sf_engine_data_types::SymmetryOperation> &symOps,
@@ -788,14 +788,16 @@ return std::sinf(std::fmodf(x, two_pi));
         const std::vector<Vector3<REAL> > &hVectors,
         const std::vector<Vector3i >& hkl_indices, // unused
         std::vector<std::complex<REAL> > &f,
-        std::vector<TargetFunctionAtomicParamDerivatives> &dTarget_dparam, // per atom // TODO generate
-        const std::vector<std::complex<REAL> > &dTarget_df, // per hkl // TODO use
+        std::vector<TargetFunctionAtomicParamDerivatives> &dTarget_dparam, // per atom
+        const std::vector<std::complex<REAL> > &dTarget_df, // per hkl
         const std::vector<bool> &include_atom_contribution, // per atom
         int nThreads,
-        const DerivativesSelector& derivativesSwitch, // TODO use
+        const DerivativesSelector& derivativesSwitch,
         bool electron, // TODO use
         const std::vector<int>& atomic_numbers) // TODO use
     {
+        nThreads = 1; // TODO remove once using proper parallel reduction for derivatives
+
         printStep("calculateSF start");
         const int trueNAtoms = atom_to_wfn_map.size();
         std::vector<int> usedAtomIndices;
@@ -1526,6 +1528,14 @@ return std::sinf(std::fmodf(x, two_pi));
         printStep("density normalization factor");
 
         f.resize(hklCount);
+
+        dTarget_dparam.resize(trueNAtoms);
+        for (int atomIdx = 0; atomIdx < trueNAtoms; atomIdx++){
+            dTarget_dparam[atomIdx].adp_derivatives.assign(atomic_displacement_parameters[atomIdx].size(), 0.0);
+            dTarget_dparam[atomIdx].atomic_position_derivatives = Vector3<REAL>(0, 0, 0);
+            dTarget_dparam[atomIdx].occupancy_derivatives = 0.0;
+        }
+
         #pragma omp parallel for num_threads(nThreads) schedule(guided)
         for (int hklIdx = 0; hklIdx<hklCount; hklIdx++){
             printInLoop("begin");
@@ -1650,9 +1660,16 @@ return std::sinf(std::fmodf(x, two_pi));
 
                 //const auto hVersorLocal = local_coordinate_systems[usedAtomIndices[atomIdx]] * hVersor;
 
+                bool iso = atomic_displacement_parameters[usedAtomIndices[atomIdx]].size() == 1;
+                const int wfnIdx = atom_to_wfn_map[usedAtomIndices[atomIdx]];
+                const auto &wfn = wfnParams[wfnIdx];
+                const auto &type = typeParams[atom_to_type_map[usedAtomIndices[atomIdx]]];
+                const auto anomalous = anomalous_dispersion.empty() ? wfn.anomalous_scattering : anomalous_dispersion[usedAtomIndices[atomIdx]];
+
+                std::array<std::complex<REAL>, 6> d_adp_p;
+                std::array<std::complex<REAL>, 3> d_xyz_p;
                 for (int symOpIdx=0; symOpIdx<symOpMultCount; symOpIdx++){
 
-                    bool iso = atomic_displacement_parameters[usedAtomIndices[atomIdx]].size() == 1;
 
                     REAL localF = temperatureFactorRoots[binIdx][atomIdx][iso?0:symOpIdx];
                     valueLog("2 - localF", localF);
@@ -1678,10 +1695,6 @@ return std::sinf(std::fmodf(x, two_pi));
 
                     valueLog("4 - localF", localF);
 
-                    const int wfnIdx = atom_to_wfn_map[usedAtomIndices[atomIdx]];
-                    const auto &wfn = wfnParams[wfnIdx];
-                    const auto &type = typeParams[atom_to_type_map[usedAtomIndices[atomIdx]]];
-
                     const auto h = (hVersor * symOpMults[symOpIdx]) * local_coordinate_systems[usedAtomIndices[atomIdx]];
                     valueLog("(square(h[0]) + square(h[1]) + square(h[2]))", (square(h[0]) + square(h[1]) + square(h[2])));
 
@@ -1703,9 +1716,40 @@ return std::sinf(std::fmodf(x, two_pi));
                     valueLog("f_core[usedWfnTypeCombo[atomToUsedWfnTypeCombo[atomIdx]][0]]", f_core[usedWfnTypeCombo[atomToUsedWfnTypeCombo[atomIdx]][0]]);
                     valueLog("val[atomToUsedWfnTypeCombo[atomIdx]]", val[atomToUsedWfnTypeCombo[atomIdx]]);
 
-                    perAtomF += symOpFMult[symOpIdx] * localF * (dval + 1.0 * f_core[usedWfnTypeCombo[atomToUsedWfnTypeCombo[atomIdx]][0]] + val[atomToUsedWfnTypeCombo[atomIdx]]);
+                    perAtomF += symOpFMult[symOpIdx] * localF * (dval + f_core[usedWfnTypeCombo[atomToUsedWfnTypeCombo[atomIdx]][0]] + val[atomToUsedWfnTypeCombo[atomIdx]] + anomalous);
+
+                    const auto h_rot = (cartesianH * symOpMults[symOpIdx]);
+                    if (derivativesSwitch.d_adp and not iso){
+                        const std::array<REAL, 6> d_adp_p_part = {h_rot[0]*h_rot[0], h_rot[1]*h_rot[1], h_rot[2]*h_rot[2], h_rot[0]*h_rot[1]*2, h_rot[0]*h_rot[2]*2, h_rot[1]*h_rot[2]*2};
+                        for (int i=0; i<6; i++){
+                            d_adp_p[i]+=d_adp_p_part[i]*symOpFMult[symOpIdx] * localF * (dval + f_core[usedWfnTypeCombo[atomToUsedWfnTypeCombo[atomIdx]][0]] + val[atomToUsedWfnTypeCombo[atomIdx]] + anomalous);
+                        }
+                    }
+                    if (derivativesSwitch.d_xyz){
+                        for (int i=0; i<3; i++){
+                            d_xyz_p[i]+=h_rot[i]*symOpFMult[symOpIdx] * localF * (dval + f_core[usedWfnTypeCombo[atomToUsedWfnTypeCombo[atomIdx]][0]] + val[atomToUsedWfnTypeCombo[atomIdx]] + anomalous);
+                        }
+                    }
                 }
                 f_acc += perAtomF * atomic_occupancy[usedAtomIndices[atomIdx]] * atomic_multiplicity_factor[usedAtomIndices[atomIdx]];
+                if (derivativesSwitch.d_xyz){
+                    for (int i=0; i<3; i++){
+                        dTarget_dparam[usedAtomIndices[atomIdx]].atomic_position_derivatives[i] -= (dTarget_df[hklIdx].real()*d_xyz_p[i].imag() + dTarget_df[hklIdx].imag()*d_xyz_p[i].real())*atomic_occupancy[usedAtomIndices[atomIdx]] * atomic_multiplicity_factor[usedAtomIndices[atomIdx]]*two_pi;
+                    }
+                }
+                if (derivativesSwitch.d_adp){
+                    if (iso){
+                        const auto d_adp_part = perAtomF * square(hLength);
+                        dTarget_dparam[usedAtomIndices[atomIdx]].adp_derivatives[0] += (d_adp_part.imag()*dTarget_df[hklIdx].imag() - d_adp_part.real()*dTarget_df[hklIdx].real()) * two_pi_squared * atomic_occupancy[usedAtomIndices[atomIdx]] * atomic_multiplicity_factor[usedAtomIndices[atomIdx]];
+                    } else {
+                        for (int i=0; i<6; i++)
+                        dTarget_dparam[usedAtomIndices[atomIdx]].adp_derivatives[i]+=(d_adp_p[i].imag()*dTarget_df[hklIdx].imag() - d_adp_p[i].real()*dTarget_df[hklIdx].real()) * two_pi_squared * atomic_occupancy[usedAtomIndices[atomIdx]] * atomic_multiplicity_factor[usedAtomIndices[atomIdx]];
+                    }
+                }
+                if (derivativesSwitch.d_occ){
+                    const auto d_occ_part = perAtomF * atomic_multiplicity_factor[usedAtomIndices[atomIdx]];
+                    dTarget_dparam[usedAtomIndices[atomIdx]].occupancy_derivatives += d_occ_part.real()*dTarget_df[hklIdx].real() - d_occ_part.imag()*dTarget_df[hklIdx].imag();
+                }
             }
             printInLoop("atom loop");
             f[hklIdx] = f_acc;
@@ -1715,8 +1759,7 @@ return std::sinf(std::fmodf(x, two_pi));
         printStep("main loop");
 
         // TODO add centrosymmetry support
-        // TODO derivatives
-        // TODO find out how to implement implement wfn.anomalous_scattering, electron
+        // TODO find out how to implement implement electron
         /*
          *    bool mUseIAM;
          *    std::vector<std::string> mIamAtomType;
